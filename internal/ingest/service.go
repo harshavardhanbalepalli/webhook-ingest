@@ -4,10 +4,10 @@ package ingest
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
-	"time"
-
 	"github.com/redis/go-redis/v9"
+	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/stats"
 	"github.com/convin/webhook-ingest/internal/store"
@@ -16,17 +16,29 @@ import (
 // recordingWork stands in for downloading and transcoding a recording.
 const recordingWork = 50 * time.Millisecond
 
+// recordingTimeout bounds how long background recording processing may run,
+// independent of any request that triggered it.
+const recordingTimeout = 30 * time.Second
+
 // Service ingests webhook deliveries.
 type Service struct {
 	store *store.Store
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+	wg    sync.WaitGroup
 }
 
 // New builds a Service.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
 	return &Service{store: s, cache: c, rdb: rdb, log: log}
+}
+
+// Wait blocks until all in-flight background work (recording processing)
+// has finished. Call it during shutdown, after the HTTP server has stopped
+// accepting new requests, and before closing the store or Redis client.
+func (s *Service) Wait() {
+	s.wg.Wait()
 }
 
 // Stats returns the cached totals for an account.
@@ -72,9 +84,15 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
+		s.wg.Add(1)
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+			defer s.wg.Done()
+
+			bgCtx, cancel := context.WithTimeout(context.Background(), recordingTimeout)
+			defer cancel()
+
+			if err := s.processRecording(bgCtx, rec); err != nil {
+				s.log.Error("process recording", "call_id", rec.CallID, "err", err)
 			}
 		}()
 	}

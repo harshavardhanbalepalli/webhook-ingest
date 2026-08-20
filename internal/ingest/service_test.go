@@ -3,11 +3,13 @@ package ingest_test
 import (
 	"context"
 	"fmt"
+	"github.com/convin/webhook-ingest/internal/ingest"
 	"github.com/convin/webhook-ingest/internal/testutil"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // eventJSON builds a well-formed call-completion payload.
@@ -119,5 +121,67 @@ func TestConcurrentDuplicateDeliveriesAreIgnored(t *testing.T) {
 	}
 	if got.CallCount != 1 {
 		t.Fatalf("call_count = %d, want 1 (deliveries were double-counted)", got.CallCount)
+	}
+}
+
+func TestRecordingProcessingSurvivesRequestContextCancellation(t *testing.T) {
+	svc, st := testutil.NewService(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	evt := ingest.Event{
+		EventID:      eventID,
+		CallID:       callID,
+		AccountID:    accountID,
+		Status:       "completed",
+		DurationSec:  143,
+		RecordingURL: "https://recordings.example.com/" + callID + ".wav",
+		OccurredAt:   time.Now(),
+	}
+
+	if err := svc.Ingest(ctx, evt); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	cancel() // simulate net/http canceling the request context the instant the handler returns
+
+	time.Sleep(200 * time.Millisecond) // well past recordingWork, so the background goroutine has had time to finish
+
+	var processed bool
+	row := st.Pool().QueryRow(context.Background(), `SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+	if err := row.Scan(&processed); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected recording to be marked processed, but the background goroutine's context was canceled before it could finish")
+	}
+}
+
+func TestWaitBlocksUntilBackgroundWorkFinishes(t *testing.T) {
+	svc, st := testutil.NewService(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+
+	evt := ingest.Event{
+		EventID:      eventID,
+		CallID:       callID,
+		AccountID:    accountID,
+		Status:       "completed",
+		DurationSec:  143,
+		RecordingURL: "https://recordings.example.com/" + callID + ".wav",
+		OccurredAt:   time.Now(),
+	}
+
+	if err := svc.Ingest(context.Background(), evt); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	svc.Wait()
+
+	var processed bool
+	row := st.Pool().QueryRow(context.Background(), `SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+	if err := row.Scan(&processed); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected Wait to block until the background goroutine finished processing the recording")
 	}
 }

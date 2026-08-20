@@ -57,6 +57,24 @@ func NewStore(t *testing.T) *store.Store {
 	return s
 }
 
+// NewService builds a Service directly (no HTTP layer), for tests that need
+// to call Ingest with a context they control themselves.
+func NewService(t *testing.T) (*ingest.Service, *store.Store) {
+	t.Helper()
+	cfg := config.Load()
+
+	s := NewStore(t)
+
+	rdb, err := redisclient.New(context.Background(), cfg.RedisAddr)
+	if err != nil {
+		t.Fatalf("connect to redis (is `docker compose up` running?): %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return ingest.New(s, stats.NewCache(), rdb, log), s
+}
+
 // NewServer starts an in-process HTTP server backed by the configured
 // Postgres and Redis, and returns it alongside the store for assertions.
 func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
