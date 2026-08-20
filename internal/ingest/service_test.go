@@ -3,11 +3,11 @@ package ingest_test
 import (
 	"context"
 	"fmt"
+	"github.com/convin/webhook-ingest/internal/testutil"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
-
-	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
 // eventJSON builds a well-formed call-completion payload.
@@ -80,5 +80,44 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+func TestConcurrentDuplicateDeliveriesAreIgnored(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+
+	const deliveries = 20
+	var wg sync.WaitGroup
+	wg.Add(deliveries)
+	for i := 0; i < deliveries; i++ {
+		go func() {
+			defer wg.Done()
+			resp := post(t, srv.URL+"/webhooks/calls", body)
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("got %d, want 200", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+
+	var n int
+	row := st.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID)
+	if err := row.Scan(&n); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 {
+		t.Fatalf("call_count = %d, want 1 (deliveries were double-counted)", got.CallCount)
 	}
 }
